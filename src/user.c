@@ -260,9 +260,14 @@ free_user(yuser *user)
 			}
 	/* close him down */
 
+	/*
+	 * If a menu or error box is up (e.g. "user refusing messages"),
+	 * don't yank it away; main_loop() will exit once it's dismissed.
+	 */
 	if (connect_list == NULL
 	    && wait_list == NULL
 	    && running_process == 0
+	    && in_ymenu() == 0
 	    && !(def_flags & FL_PERSIST))
 		bail(YTE_SUCCESS_PROMPT);
 

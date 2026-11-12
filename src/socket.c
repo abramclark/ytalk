@@ -56,6 +56,39 @@ static ylong announce_id = 0;	/* announce sequence id */
 /* ---- local functions ---- */
 
 /*
+ * Receive a datagram from a talk daemon socket without blocking.  When
+ * IP_RECVERR is enabled, ICMP errors sit on the socket's error queue and
+ * keep select() reporting it readable; drain them here and report them as
+ * ECONNREFUSED so callers neither block nor spin.
+ */
+static int
+dgram_recv(int fd, void *buf, size_t len)
+{
+#ifdef IP_RECVERR
+	int n, had_err = 0, saved_errno = errno;
+	char cbuf[512];
+	struct msghdr m;
+
+	for (;;) {
+		memset(&m, 0, sizeof(m));
+		m.msg_control = cbuf;
+		m.msg_controllen = sizeof(cbuf);
+		if (recvmsg(fd, &m, MSG_ERRQUEUE | MSG_DONTWAIT) < 0)
+			break;
+		had_err = 1;
+	}
+	n = recv(fd, buf, len, MSG_DONTWAIT);
+	if (n < 0 && had_err && (errno == EAGAIN || errno == EWOULDBLOCK))
+		errno = ECONNREFUSED;
+	else if (n >= 0)
+		errno = saved_errno;	/* don't leak EAGAIN into show_error() */
+	return n;
+#else
+	return recv(fd, buf, len, 0);
+#endif
+}
+
+/*
  * Create a datagram socket.
  */
 static int
@@ -71,6 +104,18 @@ init_dgram(struct sockaddr_in *sock)
 		show_error("init_dgram: socket() failed");
 		bail(YTE_ERROR);
 	}
+#ifdef IP_RECVERR
+	{
+		/*
+		 * Linux doesn't report ICMP port-unreachable errors on
+		 * unconnected UDP sockets unless asked to.  Without this, a
+		 * missing talk daemon is only detected by timing out, which
+		 * makes YTalk appear frozen at startup.
+		 */
+		int on = 1;
+		setsockopt(fd, IPPROTO_IP, IP_RECVERR, &on, sizeof(on));
+	}
+#endif
 	if (bind(fd, (struct sockaddr *) sock, sizeof(struct sockaddr_in)) != 0) {
 		close(fd);
 		show_error("init_dgram: bind() failed");
@@ -276,8 +321,9 @@ sendit(ylong addr, int d)
 		}
 		if (n <= 0)
 			break;
-		if (recv(talkd[d].fd, talkd[d].rptr, talkd[d].rlen, 0) < 0) {
-			if (errno != EINTR) {
+		if (dgram_recv(talkd[d].fd, talkd[d].rptr, talkd[d].rlen) < 0) {
+			/* stale ICMP errors from earlier probes are harmless */
+			if (errno != EINTR && errno != ECONNREFUSED && errno != EAGAIN) {
 				show_error("sendit: flush recv() failed");
 				return -1;
 			}
@@ -311,7 +357,7 @@ sendit(ylong addr, int d)
 		} while (n <= 0);	/* ie: until we receive a reply */
 
 		do {
-			n = recv(talkd[d].fd, talkd[d].rptr, talkd[d].rlen, 0);
+			n = dgram_recv(talkd[d].fd, talkd[d].rptr, talkd[d].rlen);
 			if (n < 0) {
 				show_error("sendit: recv() failed");
 				return -1;
@@ -377,7 +423,7 @@ find_daemon(ylong addr)
 	CTL_MSG42 m2;
 	struct sockaddr_in remote_daemon;
 	struct timeval tv;
-	int out, max;
+	int out, refused, max;
 	fd_set sel;
 	static hostinfo *host_head = NULL;
 
@@ -409,7 +455,12 @@ find_daemon(ylong addr)
 	m1.ctl_addr.sin_family = m2.ctl_addr.sin_family = htons(AF_INET);
 
 	out = 0;
-	for (i = 0; i < 5; i++) {
+	refused = 0;
+	for (i = 0; i < 5 && out == 0; i++) {
+		/* every daemon actively refused us; no point retrying */
+		if (refused == ((1 << ntalk) | (1 << otalk)))
+			break;
+
 		IN_PORT(remote_daemon) = talkd[ntalk].port;
 		n = sendto(talkd[ntalk].fd, (char *) &m2, sizeof(m2),
 			   0, (struct sockaddr *) & remote_daemon, sizeof(remote_daemon));
@@ -444,12 +495,13 @@ find_daemon(ylong addr)
 				if (FD_ISSET(talkd[d].fd, &sel)) {
 					int r;
 
-					r = recv(talkd[d].fd, errstr, talkd[d].rlen, 0);
+					r = dgram_recv(talkd[d].fd, errstr, talkd[d].rlen);
 					if (r < 0) {
-						if (errno == EINTR || errno == ECONNREFUSED)
-							continue;
-						else
+						if (errno == ECONNREFUSED)
+							refused |= (1 << d);
+						else if (errno != EINTR)
 							show_error("find_daemon: recv() failed");
+						continue;
 					}
 					out |= (1 << d);
 				}
@@ -462,18 +514,24 @@ find_daemon(ylong addr)
 			if ((n = select(1 + max, &sel, NULL, NULL, &tv)) < 0)
 				show_error("find_daemon: second select() failed");
 		} while (n > 0);
-
-		h = (hostinfo *) malloc(sizeof(hostinfo));
-		h->next = host_head;
-		host_head = h;
-		h->host_addr = addr;
-		h->dtype = out;
-		if (out)
-			return out;
 	}
-	snprintf(errstr, MAXERR, "No talk daemon on %s", host_name(addr));
-	show_error(errstr);
-	return 0;
+
+	/*
+	 * Remember the result, including failure, so that later lookups of
+	 * the same host don't block for another round of timeouts.
+	 */
+	h = (hostinfo *) malloc(sizeof(hostinfo));
+	h->next = host_head;
+	host_head = h;
+	h->host_addr = addr;
+	h->dtype = out;
+
+	if (out == 0) {
+		snprintf(errstr, MAXERR, "No talk daemon on %s", host_name(addr));
+		errno = 0;
+		show_error(errstr);
+	}
+	return out;
 }
 
 /* ---- global functions ---- */
