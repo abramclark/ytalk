@@ -267,10 +267,13 @@ place_my_address(BSD42_SOCK *sock)
  * addr = host internet address
  * d = daemon number
  */
+/* how many times sendit() transmits before giving up (5s apart) */
+#define SENDIT_TRIES 4
+
 static int
 sendit(ylong addr, int d)
 {
-	int n;
+	int n, tries;
 	struct sockaddr_in remote_daemon;
 	struct timeval tv;
 	char *rtype, *mtype;
@@ -337,8 +340,22 @@ sendit(ylong addr, int d)
 	 * unreliable sockets, and maybe even different daemons on different
 	 * machines. Is *nothing* reliable anymore???
 	 */
+	tries = 0;
 	do {
 		do {
+			/*
+			 * Don't retry forever: a daemon that never sends a
+			 * matching reply (wrong protocol, or gone) would
+			 * otherwise hang YTalk for good.
+			 */
+			if (++tries > SENDIT_TRIES) {
+				snprintf(errstr, MAXERR,
+					 "Talk daemon on %s not responding",
+					 host_name(addr));
+				errno = 0;
+				show_error(errstr);
+				return -1;
+			}
 			n = sendto(talkd[d].fd, (char *) talkd[d].mptr, talkd[d].mlen,
 				   0, (struct sockaddr *) & remote_daemon, sizeof(remote_daemon));
 			if (n != talkd[d].mlen) {
@@ -451,6 +468,13 @@ find_daemon(ylong addr)
 	m1.r_tty[0] = m2.r_tty[0] = '\0';
 	strcpy(m1.r_name, "ytalk");
 	strcpy(m2.r_name, "ytalk");
+	/*
+	 * Many systems (e.g. Debian's talkd) serve the old "talk" port with
+	 * the new-protocol daemon.  It reads byte 1 of our old-style packet
+	 * (l_name[0]) as the request type; a non-numeric name guarantees it
+	 * answers UNKNOWN_REQUEST, which we can tell apart below.
+	 */
+	strncpy(m1.l_name, "ytalk", NAME_SIZE);
 	m1.addr.sin_family = m2.addr.sin_family = htons(AF_INET);
 	m1.ctl_addr.sin_family = m2.ctl_addr.sin_family = htons(AF_INET);
 
@@ -503,6 +527,20 @@ find_daemon(ylong addr)
 							show_error("find_daemon: recv() failed");
 						continue;
 					}
+					/*
+					 * Old-protocol responses have a zero
+					 * filler in byte 2; a new-protocol
+					 * daemon puts its answer there.  So a
+					 * nonzero byte 2 on the old port means
+					 * a new daemon that can't understand
+					 * us.  On the new port, insist on the
+					 * right version byte.
+					 */
+					if (d == otalk && r >= 3 && errstr[2] != 0)
+						continue;
+					if (d == ntalk && (r < 3
+					    || (unsigned char) errstr[0] != TALK_VERSION))
+						continue;
 					out |= (1 << d);
 				}
 			tv.tv_sec = 0L;
